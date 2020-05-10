@@ -140,6 +140,33 @@ private:
 	static FARPROC fpSetFileValidData;
 	static FARPROC fpDeviceIoControl;
 
+	static int SetPos(HANDLE hFile, LLARGE_INTEGER liDistanceToMove, PLLARGE_INTEGER lpNewFilePointer, DWORD dwMoveMethod)
+	{
+		if(fpSetFilePointerEx)
+		{
+			if (!((LPSetFilePointerEx)fpSetFilePointerEx)(hFile, liDistanceToMove, lpNewFilePointer, dwMoveMethod))
+				return EBADF;
+		}
+		else if(fpSetFilePointer)
+		{
+			LONG resHigh = liDistanceToMove.u.HighPart;
+			DWORD resLow = ((LPSetFilePointer)fpSetFilePointer)(hFile, liDistanceToMove.u.LowPart, &resHigh, dwMoveMethod);
+			if (resLow == INVALID_SET_FILE_POINTER)
+				return EBADF;
+
+			if(lpNewFilePointer != NULL)
+			{
+				lpNewFilePointer->u.LowPart = resLow;
+				lpNewFilePointer->u.HighPart = resHigh;
+			}
+		}
+		else
+		{
+			return ENOSYS; // TODO: what now?
+		}
+		
+		return 0;
+	}
 public:
 	Fallocate()
 	{
@@ -223,6 +250,7 @@ public:
 		LLARGE_INTEGER newPos;
 		LLARGE_INTEGER minusOne;
 		static const DWORD DWORD_MAX=0xFFFFFFFF;
+		int setPosRes;
 
 		minusOne.u.HighPart = 0xFFFFFFFF;
 		minusOne.u.LowPart = 0xFFFFFFFF;
@@ -240,88 +268,41 @@ public:
 			return EINVAL;
 		}
 
-		if(fpSetFilePointerEx)
+		// get original position.
+		setPosRes = SetPos(h, zeroPos, &oldPos, FILE_CURRENT);
+		if(setPosRes)
 		{
-			if (!((LPSetFilePointerEx)fpSetFilePointerEx)(h, zeroPos, &oldPos, FILE_CURRENT))
-				return EBADF;
-		}
-		else if(fpSetFilePointer)
-		{
-			LONG resHigh = zeroHigh;
-			DWORD resLow = ((LPSetFilePointer)fpSetFilePointer)(h, zeroLow, &resHigh, FILE_CURRENT);
-			if (resLow == INVALID_SET_FILE_POINTER)
-				return EBADF;
-
-			oldPos.u.LowPart = resHigh;
-			oldPos.u.HighPart = zeroHigh;
-		}
-		else
-		{
-			return ENOSYS; // TODO: what now?
+			return setPosRes;
 		}
 
-		if(fpSetFilePointerEx)
+		// get current file end.
+		setPosRes = SetPos(h, zeroPos, &endPos, FILE_END);
+		if(setPosRes)
 		{
-			if (!((LPSetFilePointerEx)fpSetFilePointerEx)(h, zeroPos, &endPos, FILE_END))
-				return EBADF;
-		}
-		else if(fpSetFilePointer)
-		{
-			LONG resHigh = zeroHigh;
-			DWORD resLow = ((LPSetFilePointer)fpSetFilePointer)(h, zeroLow, &resHigh, FILE_END);
-			if (resLow == INVALID_SET_FILE_POINTER)
-				return EBADF;
-
-			endPos.u.LowPart = resLow;
-			endPos.u.HighPart = resHigh;
-		}
-		else
-		{
-			return ENOSYS; // TODO: what now?
+			return setPosRes;
 		}
 
-		if(fpSetFilePointerEx)
+		// jump to offset.
+		LLARGE_INTEGER tmpPos;
+		tmpPos.u.LowPart = offset;
+		tmpPos.u.HighPart = 0;
+
+		setPosRes = SetPos(h, tmpPos, NULL, FILE_BEGIN);
+		if(setPosRes)
 		{
-			LLARGE_INTEGER tmpPos;
-			tmpPos.u.LowPart = offset;
-			tmpPos.u.HighPart = 0;
-
-			if (!((LPSetFilePointerEx)fpSetFilePointerEx)(h, tmpPos, NULL, FILE_BEGIN))
-				return EBADF;
-
-			tmpPos.u.LowPart = len;
-			tmpPos.u.HighPart = 0;
-
-			if (!((LPSetFilePointerEx)fpSetFilePointerEx)(h, tmpPos, &newPos, FILE_CURRENT))
-				return EBADF;
+			SetPos(h, oldPos, NULL, FILE_BEGIN); // restore position on error.
+			return setPosRes;
 		}
-		else if(fpSetFilePointer)
+
+		// jump to length.
+		tmpPos.u.LowPart = len;
+		tmpPos.u.HighPart = 0;
+		
+		setPosRes = SetPos(h, tmpPos, &newPos, FILE_CURRENT);
+		if(setPosRes)
 		{
-			LONG tmpHigh;
-			DWORD tmpLow;
-			LONG low;
-			LONG high;
-
-			low = offset;
-			high = 0;
-			tmpHigh = high;
-			tmpLow = ((LPSetFilePointer)fpSetFilePointer)(h, low, &tmpHigh, FILE_BEGIN);
-			if (tmpLow == INVALID_SET_FILE_POINTER)
-				return EBADF;
-
-			low = len;
-			high = 0;
-			tmpHigh = high;
-			tmpLow = ((LPSetFilePointer)fpSetFilePointer)(h, low, &tmpHigh, FILE_CURRENT);
-			if (tmpLow == INVALID_SET_FILE_POINTER)
-				return EBADF;
-
-			newPos.u.HighPart = tmpHigh;
-			newPos.u.LowPart = tmpLow;
-		}
-		else
-		{
-			return ENOSYS; // TODO: what now?
+			SetPos(h, oldPos, NULL, FILE_BEGIN); // restore position on error.
+			return setPosRes;
 		}
 
 		if(fpSetEndOfFile)
@@ -331,6 +312,7 @@ public:
 			{
 				if(!((LPSetEndOfFile)fpSetEndOfFile)(h))
 				{
+					SetPos(h, oldPos, NULL, FILE_BEGIN); // restore position on error.
 					return ENOSPC;
 				}
 			}
@@ -341,6 +323,7 @@ public:
 		{
 			if (((LPSetFileValidData)fpSetFileValidData)(h, sizeToReserve)!=0)
 			{
+				SetPos(h, oldPos, NULL, FILE_BEGIN); // restore position on success.
 				return 0; //Success!
 			}
 		}
@@ -357,37 +340,29 @@ public:
 				range.BeyondFinalZero.QuadPart = newPos.QuadPart;
 				//Actually set the sparse range.
 				if (((LPDeviceIoControl)fpDeviceIoControl)(h, FSCTL_SET_ZERO_DATA, &range, sizeof(range), NULL, 0, &temp, NULL))
-					return 0; //Done		
+				{
+					SetPos(h, oldPos, NULL, FILE_BEGIN); // restore position on success.
+					return 0; //Done
+				}					
 			}
 		}
 
-		if(fpSetFilePointerEx)
+		setPosRes = SetPos(h, minusOne, &tmpPos, FILE_END);
+		if(setPosRes)
 		{
-			LLARGE_INTEGER tmpPos;
-			if (!((LPSetFilePointerEx)fpSetFilePointerEx)(h, minusOne, &tmpPos, FILE_END))
-				return EBADF;
-
-		}
-		else if(fpSetFilePointer)
-		{
-			LONG tmpHigh = minusOne.u.HighPart;
-			DWORD tmpLow = (DWORD)minusOne.u.LowPart;
-			tmpLow = ((LPSetFilePointer)fpSetFilePointer)(h, tmpLow, &tmpHigh, FILE_END);
-			if (tmpLow == INVALID_SET_FILE_POINTER)
-				return EBADF;
-		}
-		else
-		{
-			return ENOSYS; // TODO: what now?
+			SetPos(h, oldPos, NULL, FILE_BEGIN); // restore position on error.
+			return setPosRes;
 		}
 
 		char initializer_buf [1] = {1};
 		DWORD written=0;
 		if (!WriteFile(h, initializer_buf, 1, &written, NULL))
 		{
+			SetPos(h, oldPos, NULL, FILE_BEGIN); // restore position on error.
 			return ENOSPC;
 		}
 
+		SetPos(h, oldPos, NULL, FILE_BEGIN); // restore position on success.
 		return 0;
 	}
 
@@ -401,6 +376,7 @@ public:
 		LLARGE_INTEGER newPos;
 		LLARGE_INTEGER minusOne;
 		static const DWORD DWORD_MAX=0xFFFFFFFF;
+		int setPosRes;
 
 		minusOne.u.HighPart = 0xFFFFFFFF;
 		minusOne.u.LowPart = 0xFFFFFFFF;
@@ -418,88 +394,41 @@ public:
 			return EINVAL;
 		}
 
-		if(fpSetFilePointerEx)
+		// get original position.
+		setPosRes = SetPos(h, zeroPos, &oldPos, FILE_CURRENT);
+		if(setPosRes)
 		{
-			if (!((LPSetFilePointerEx)fpSetFilePointerEx)(h, zeroPos, &oldPos, FILE_CURRENT))
-				return EBADF;
-		}
-		else if(fpSetFilePointer)
-		{
-			LONG resHigh = zeroHigh;
-			DWORD resLow = ((LPSetFilePointer)fpSetFilePointer)(h, zeroLow, &resHigh, FILE_CURRENT);
-			if (resLow == INVALID_SET_FILE_POINTER)
-				return EBADF;
-
-			oldPos.u.LowPart = resHigh;
-			oldPos.u.HighPart = zeroHigh;
-		}
-		else
-		{
-			return ENOSYS; // TODO: what now?
+			return setPosRes;
 		}
 
-		if(fpSetFilePointerEx)
+		// get current file end.
+		setPosRes = SetPos(h, zeroPos, &endPos, FILE_END);
+		if(setPosRes)
 		{
-			if (!((LPSetFilePointerEx)fpSetFilePointerEx)(h, zeroPos, &endPos, FILE_END))
-				return EBADF;
-		}
-		else if(fpSetFilePointer)
-		{
-			LONG resHigh = zeroHigh;
-			DWORD resLow = ((LPSetFilePointer)fpSetFilePointer)(h, zeroLow, &resHigh, FILE_END);
-			if (resLow == INVALID_SET_FILE_POINTER)
-				return EBADF;
-
-			endPos.u.LowPart = resLow;
-			endPos.u.HighPart = resHigh;
-		}
-		else
-		{
-			return ENOSYS; // TODO: what now?
+			return setPosRes;
 		}
 
-		if(fpSetFilePointerEx)
+		// jump to offset.
+		LLARGE_INTEGER tmpPos;
+		tmpPos.u.LowPart = offset;
+		tmpPos.u.HighPart = 0;
+
+		setPosRes = SetPos(h, tmpPos, NULL, FILE_BEGIN);
+		if(setPosRes)
 		{
-			LLARGE_INTEGER tmpPos;
-			tmpPos.u.LowPart = offset;
-			tmpPos.u.HighPart = 0;
-
-			if (!((LPSetFilePointerEx)fpSetFilePointerEx)(h, tmpPos, NULL, FILE_BEGIN))
-				return EBADF;
-
-			tmpPos.u.LowPart = len;
-			tmpPos.u.HighPart = 0;
-
-			if (!((LPSetFilePointerEx)fpSetFilePointerEx)(h, tmpPos, &newPos, FILE_CURRENT))
-				return EBADF;
+			SetPos(h, oldPos, NULL, FILE_BEGIN); // restore position on error.
+			return setPosRes;
 		}
-		else if(fpSetFilePointer)
+
+		// jump to length.
+		tmpPos.u.LowPart = len;
+		tmpPos.u.HighPart = 0;
+		
+		setPosRes = SetPos(h, tmpPos, &newPos, FILE_CURRENT);
+		if(setPosRes)
 		{
-			LONG tmpHigh;
-			DWORD tmpLow;
-			LONG low;
-			LONG high;
-
-			low = offset;
-			high = 0;
-			tmpHigh = high;
-			tmpLow = ((LPSetFilePointer)fpSetFilePointer)(h, low, &tmpHigh, FILE_BEGIN);
-			if (tmpLow == INVALID_SET_FILE_POINTER)
-				return EBADF;
-
-			low = len;
-			high = 0;
-			tmpHigh = high;
-			tmpLow = ((LPSetFilePointer)fpSetFilePointer)(h, low, &tmpHigh, FILE_CURRENT);
-			if (tmpLow == INVALID_SET_FILE_POINTER)
-				return EBADF;
-
-			newPos.u.HighPart = tmpHigh;
-			newPos.u.LowPart = tmpLow;
-		}
-		else
-		{
-			return ENOSYS; // TODO: what now?
+			SetPos(h, oldPos, NULL, FILE_BEGIN); // restore position on error.
+			return setPosRes;
 		}
 
 		if(fpSetEndOfFile)
@@ -509,38 +438,28 @@ public:
 			{
 				if(!((LPSetEndOfFile)fpSetEndOfFile)(h))
 				{
+					SetPos(h, oldPos, NULL, FILE_BEGIN); // restore position on error.
 					return ENOSPC;
 				}
 			}
 		}
 
-		if(fpSetFilePointerEx)
+		setPosRes = SetPos(h, minusOne, &tmpPos, FILE_END);
+		if(setPosRes)
 		{
-			LLARGE_INTEGER tmpPos;
-			if (!((LPSetFilePointerEx)fpSetFilePointerEx)(h, minusOne, &tmpPos, FILE_END))
-				return EBADF;
-
-		}
-		else if(fpSetFilePointer)
-		{
-			LONG tmpHigh = minusOne.u.HighPart;
-			DWORD tmpLow = (DWORD)minusOne.u.LowPart;
-			tmpLow = ((LPSetFilePointer)fpSetFilePointer)(h, tmpLow, &tmpHigh, FILE_END);
-			if (tmpLow == INVALID_SET_FILE_POINTER)
-				return EBADF;
-		}
-		else
-		{
-			return ENOSYS; // TODO: what now?
+			SetPos(h, oldPos, NULL, FILE_BEGIN); // restore position on error.
+			return setPosRes;
 		}
 
 		char initializer_buf [1] = {1};
 		DWORD written=0;
 		if (!WriteFile(h, initializer_buf, 1, &written, NULL))
 		{
+			SetPos(h, oldPos, NULL, FILE_BEGIN); // restore position on error.
 			return ENOSPC;
 		}
 
+		SetPos(h, oldPos, NULL, FILE_BEGIN); // restore position on success.
 		return 0;
 	}
 
@@ -592,8 +511,6 @@ FARPROC Fallocate::fpSetFileValidData = NULL;
 FARPROC Fallocate::fpDeviceIoControl = NULL;
 
 static Fallocate _fallocate;
-
-#include <stdio.h>
 
 int posix_fallocate(int fd, off_t offset, off_t len)
 {
